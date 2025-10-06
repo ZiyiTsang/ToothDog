@@ -1,4 +1,4 @@
-# Tooth Segmentation and Classification
+# ToothDog
 
 A multi-task deep learning framework for dental image analysis, supporting tooth segmentation, classification, and multi-task learning with various backbone architectures.
 
@@ -10,10 +10,14 @@ This project provides a unified framework for dental image analysis tasks includ
 
 
 ## Logs and Results
+Here, We only provide segmentation-only result.
+
 
 View detailed training logs, metrics, and experiment tracking on [Comet ML](https://www.comet.com/ziyitsang/tooth-segmentation/view/new/panels).
 
 ![Case Study](artifact/case_study.png)
+
+
 
 
 ## Guidelines
@@ -45,6 +49,8 @@ pip install torch torchvision pytorch-lightning albumentations torchmetrics come
 
 ### Training
 
+
+
 ```bash
 python multi_task_main.py --model [model_name] --mode segmentation
 ```
@@ -55,6 +61,7 @@ python multi_task_main.py --model [model_name] --mode classification
 python multi_task_main.py --model [model_name] --mode multi-task
 ```
 
+Replace `[model_name]` in training commands with any of the below model names.
 
 ### Multi-model Batch Training 
 
@@ -98,7 +105,6 @@ The framework supports the following segmentation models:
 - **FCN**: `fcn_resnet50`, `fcn_resnet101`
 - **LR-ASPP**: `lraspp_mobilenet_v3_large`
 
-Replace `[model_name]` in training commands with any of the above model names.
 
 
 
