@@ -63,7 +63,7 @@ for model in "${models[@]}"; do
     echo "----------------------------------------"
     
     # Run training command with specified mode and error handling
-    if python multi_task_main.py \
+    if python main.py \
         --model "$model" \
         --mode "$MODE"; then
         echo "✅ $model - Training completed successfully!"

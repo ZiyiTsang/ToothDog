@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main training script for tooth segmentation with Comet ML integration
+Multi-task training script for simultaneous tooth segmentation and tooth ID classification
 Supports multiple pretrained models and handles device compatibility
 """
 
@@ -8,17 +8,17 @@ import os
 import argparse
 import torch
 import lightning as L
-from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Callback
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, Callback, LearningRateMonitor, GradientAccumulationScheduler
 from lightning.pytorch.loggers import CometLogger
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 
-from model import ToothSegmentationModel
+from model import ToothModel
 from dataModule import ToothDataModule
 
 
-def setup_comet_logger(api_key=None, project_name="tooth-segmentation", experiment_name=None):
+def setup_comet_logger(api_key=None, project_name="tooth-multi-task", experiment_name=None):
     """
     Setup Comet ML logger for experiment tracking
     
@@ -61,30 +61,39 @@ def get_available_models():
     }
 
 
-def create_model(model_name, num_classes=1, learning_rate=1e-4, tooth_ids=None):
+def create_multi_task_model(model_name, num_seg_classes=5, num_tooth_classes=31, learning_rate=1e-4,
+                           seg_loss_weight=0.7, cls_loss_weight=0.3, tooth_ids=None, mode='multi-task'):
     """
-    Create segmentation model with specified architecture
+    Create unified tooth model supporting three training modes
     
     Args:
         model_name: Name of the model architecture
-        num_classes: Number of output classes (1 for binary segmentation)
+        num_seg_classes: Number of segmentation classes (5 for multi-class segmentation)
+        num_cls_classes: Number of classification classes (31 for tooth IDs)
         learning_rate: Learning rate for training
+        seg_loss_weight: Weight for segmentation loss
+        cls_loss_weight: Weight for classification loss
         tooth_ids: List of tooth IDs to segment
+        mode: Training mode - 'classification', 'segmentation', or 'multi-task'
     
     Returns:
-        ToothSegmentationModel instance
+        ToothModel instance
     """
     available_models = get_available_models()
     
     if model_name not in available_models:
         raise ValueError(f"Model {model_name} not available. Available models: {list(available_models.keys())}")
     
-    print(f"🔄 Creating {model_name} model...")
-    return ToothSegmentationModel(
+    print(f"🔄 Creating {mode} {model_name} model...")
+    return ToothModel(
         model_name=model_name,
-        num_classes=num_classes,
+        num_seg_classes=num_seg_classes,
+        num_tooth_classes=num_tooth_classes,
         learning_rate=learning_rate,
-        tooth_ids=tooth_ids
+        seg_loss_weight=seg_loss_weight,
+        cls_loss_weight=cls_loss_weight,
+        tooth_ids=tooth_ids,
+        mode=mode
     )
 
 
@@ -110,8 +119,8 @@ def setup_data_module(data_dir, batch_size, num_workers, tooth_ids=None):
     )
 
 
-class ImageLoggingCallback(Callback):
-    """Callback to log images to Comet ML every epoch"""
+class MultiTaskImageLoggingCallback(Callback):
+    """Callback to log images and classification results to Comet ML every epoch"""
     
     def __init__(self, log_every_n_epochs=1, num_samples=4):
         self.log_every_n_epochs = log_every_n_epochs
@@ -141,14 +150,18 @@ class ImageLoggingCallback(Callback):
             masks = masks.to(device)
             tooth_ids = tooth_ids.to(device)
             
-            # Get predictions for multi-class segmentation
+            # Get predictions for multi-task learning
             with torch.no_grad():
-                outputs = pl_module(images, tooth_ids)
-                preds = torch.softmax(outputs, dim=1)
-                preds_class = torch.argmax(preds, dim=1)
+                seg_outputs, cls_outputs = pl_module(images, tooth_ids)
+                seg_preds = torch.softmax(seg_outputs, dim=1)
+                seg_preds_class = torch.argmax(seg_preds, dim=1)
+                
+                cls_preds = torch.softmax(cls_outputs, dim=1)
+                cls_preds_class = torch.argmax(cls_preds, dim=1)
             
-            # Log images
-            self._log_images_to_comet(trainer, pl_module, images, masks, preds_class, 'val')
+            # Log images and classification results
+            self._log_multi_task_results(trainer, pl_module, images, masks, tooth_ids, 
+                                       seg_preds_class, cls_preds_class, 'val')
             break
     
     def on_train_epoch_end(self, trainer, pl_module):
@@ -173,18 +186,23 @@ class ImageLoggingCallback(Callback):
             masks = masks.to(device)
             tooth_ids = tooth_ids.to(device)
             
-            # Get predictions for multi-class segmentation
+            # Get predictions for multi-task learning
             with torch.no_grad():
-                outputs = pl_module(images, tooth_ids)
-                preds = torch.softmax(outputs, dim=1)
-                preds_class = torch.argmax(preds, dim=1)
+                seg_outputs, cls_outputs = pl_module(images, tooth_ids)
+                seg_preds = torch.softmax(seg_outputs, dim=1)
+                seg_preds_class = torch.argmax(seg_preds, dim=1)
+                
+                cls_preds = torch.softmax(cls_outputs, dim=1)
+                cls_preds_class = torch.argmax(cls_preds, dim=1)
             
-            # Log images
-            self._log_images_to_comet(trainer, pl_module, images, masks, preds_class, 'train')
+            # Log images and classification results
+            self._log_multi_task_results(trainer, pl_module, images, masks, tooth_ids,
+                                       seg_preds_class, cls_preds_class, 'train')
             break
     
-    def _log_images_to_comet(self, trainer, pl_module, images, masks, preds, split):
-        """Log images to Comet ML for visualization"""
+    def _log_multi_task_results(self, trainer, pl_module, images, masks, tooth_ids,
+                              seg_preds, cls_preds, split):
+        """Log multi-task results to Comet ML for visualization with enhanced classification and segmentation display"""
         batch_size = min(self.num_samples, images.shape[0])
         
         for i in range(batch_size):
@@ -197,56 +215,162 @@ class ImageLoggingCallback(Callback):
             gt_mask = masks[i].cpu().numpy()
             
             # Prediction (multi-class)
-            pred_mask = preds[i].cpu().numpy().astype(np.uint8)
+            pred_mask = seg_preds[i].cpu().numpy().astype(np.uint8)
             
-            # Create figure with subplots
-            if split == 'val':
-                # For validation: use 3 subplots (original, ground truth mask, prediction mask)
-                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            # Ground truth tooth ID (convert one-hot to class index)
+            gt_tooth_id = torch.argmax(tooth_ids[i]).item()
+            pred_tooth_id = cls_preds[i].item()
+            
+            # Get classification confidence scores
+            with torch.no_grad():
+                # Forward pass to get confidence scores - use eval mode to avoid BatchNorm issues
+                pl_module.eval()
+                seg_outputs, cls_outputs = pl_module(images[i:i+1])
+                cls_probs = torch.softmax(cls_outputs, dim=1)[0]
+                seg_probs = torch.softmax(seg_outputs, dim=1)[0]
+                pl_module.train()  # Restore training mode
+            
+            cls_confidence = cls_probs.max().item()
+            seg_confidence = seg_probs.max(dim=0)[0].mean().item()  # Average confidence across pixels
+            
+            # Create figure with subplots - larger figure for more detailed visualization
+            fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+            
+            # Row 1: Original image and masks
+            # Original image
+            axes[0, 0].imshow(img_np)
+            axes[0, 0].set_title(f'{split.capitalize()} Original Image', fontsize=12, fontweight='bold')
+            axes[0, 0].axis('off')
+            
+            # Ground truth mask
+            axes[0, 1].imshow(gt_mask, cmap='tab10', vmin=0, vmax=4)
+            axes[0, 1].set_title(f'{split.capitalize()} Ground Truth Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)',
+                               fontsize=12, fontweight='bold')
+            axes[0, 1].axis('off')
+            
+            # Prediction mask
+            axes[0, 2].imshow(pred_mask, cmap='tab10', vmin=0, vmax=4)
+            axes[0, 2].set_title(f'{split.capitalize()} Prediction Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)',
+                               fontsize=12, fontweight='bold')
+            axes[0, 2].axis('off')
+            
+            # Row 2: Comparison and confidence visualization
+            # Create overlay comparison
+            overlay_img = img_np.copy()
+            diff_mask = (pred_mask != gt_mask)
+            overlay_img[diff_mask] = [1.0, 0.0, 0.0]  # Red for differences
+            
+            axes[1, 0].imshow(overlay_img)
+            axes[1, 0].set_title(f'{split.capitalize()} Differences\n(Red: prediction ≠ ground truth)',
+                               fontsize=12, fontweight='bold')
+            axes[1, 0].axis('off')
+            
+            # Segmentation confidence heatmap
+            seg_confidence_map = seg_probs.max(dim=0)[0].cpu().numpy()
+            im = axes[1, 1].imshow(seg_confidence_map, cmap='viridis', vmin=0, vmax=1)
+            axes[1, 1].set_title(f'Segmentation Confidence Heatmap\n(Mean: {seg_confidence:.3f})',
+                               fontsize=12, fontweight='bold')
+            axes[1, 1].axis('off')
+            plt.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
+            
+            # Classification confidence bar chart
+            top_k = 5
+            top_probs, top_indices = torch.topk(cls_probs, top_k)
+            top_probs = top_probs.cpu().numpy()
+            top_indices = top_indices.cpu().numpy()
+            
+            bars = axes[1, 2].bar(range(top_k), top_probs, color=['red' if idx == pred_tooth_id else 'blue' for idx in top_indices])
+            axes[1, 2].set_title(f'Top {top_k} Classification Probabilities', fontsize=12, fontweight='bold')
+            axes[1, 2].set_ylabel('Probability')
+            axes[1, 2].set_xticks(range(top_k))
+            axes[1, 2].set_xticklabels([f'ID:{idx}' for idx in top_indices], rotation=45)
+            axes[1, 2].set_ylim(0, 1)
+            
+            # Add probability values on bars
+            for bar, prob in zip(bars, top_probs):
+                height = bar.get_height()
+                axes[1, 2].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                              f'{prob:.3f}', ha='center', va='bottom', fontsize=10)
+            
+            # Row 3: Detailed classification results and tooth highlighting
+            # Tooth ID classification results
+            classification_correct = (pred_tooth_id == gt_tooth_id)
+            result_color = 'green' if classification_correct else 'red'
+            
+            axes[2, 0].text(0.1, 0.7,
+                           f'Ground Truth Tooth ID: {gt_tooth_id}\n'
+                           f'Predicted Tooth ID: {pred_tooth_id}\n'
+                           f'Classification: {"✓ CORRECT" if classification_correct else "✗ WRONG"}',
+                           fontsize=14, transform=axes[2, 0].transAxes,
+                           color=result_color, fontweight='bold')
+            axes[2, 0].set_title('Tooth ID Classification Results', fontsize=12, fontweight='bold')
+            axes[2, 0].axis('off')
+            
+            # Highlight specific tooth in segmentation mask
+            # Create highlighted mask where only the predicted tooth is shown
+            highlighted_mask = np.zeros_like(pred_mask)
+            
+            # Find the specific tooth region (class 3 in segmentation mask)
+            specific_tooth_mask = (pred_mask == 3)
+            
+            if np.any(specific_tooth_mask):
+                # Create overlay with highlighted specific tooth
+                highlight_img = img_np.copy()
+                # Color the specific tooth region in yellow
+                highlight_img[specific_tooth_mask] = [1.0, 1.0, 0.0]  # Yellow highlight
                 
-                # Original image
-                axes[0].imshow(img_np)
-                axes[0].set_title(f'{split.capitalize()} Original')
-                axes[0].axis('off')
+                axes[2, 1].imshow(highlight_img)
+                axes[2, 1].set_title(f'Highlighted Tooth ID: {pred_tooth_id}\n(Yellow: specific tooth region)',
+                                   fontsize=12, fontweight='bold')
+                axes[2, 1].axis('off')
                 
-                # Ground truth mask (从左往右第二张图)
-                axes[1].imshow(gt_mask, cmap='tab10', vmin=0, vmax=4)
-                axes[1].set_title(f'{split.capitalize()} Ground Truth Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)')
-                axes[1].axis('off')
+                # Log highlighted tooth image separately to Comet ML for better visualization
+                fig_highlight, ax_highlight = plt.subplots(1, 2, figsize=(12, 6))
                 
-                # Prediction mask
-                axes[2].imshow(pred_mask, cmap='tab10', vmin=0, vmax=4)
-                axes[2].set_title(f'{split.capitalize()} Prediction Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)')
-                axes[2].axis('off')
+                # Original image with highlighted tooth
+                ax_highlight[0].imshow(highlight_img)
+                ax_highlight[0].set_title(f'Highlighted Tooth ID: {pred_tooth_id}', fontsize=14, fontweight='bold')
+                ax_highlight[0].axis('off')
+                
+                # Segmentation mask comparison
+                ax_highlight[1].imshow(pred_mask, cmap='tab10', vmin=0, vmax=4)
+                ax_highlight[1].set_title(f'Segmentation Mask\n(Class 3: Specific Tooth)', fontsize=14, fontweight='bold')
+                ax_highlight[1].axis('off')
+                
+                plt.tight_layout()
+                
+                # Log highlighted tooth image to Comet ML
+                trainer.logger.experiment.log_figure(
+                    figure_name=f'{split}_highlighted_tooth_{pred_tooth_id}_epoch_{trainer.current_epoch}_sample_{i}',
+                    figure=fig_highlight,
+                    step=trainer.current_epoch
+                )
+                
+                plt.close(fig_highlight)
                 
             else:
-                # For training: use 4 subplots (original, ground truth mask, prediction mask, comparison)
-                fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-                
-                # Original image
-                axes[0].imshow(img_np)
-                axes[0].set_title(f'{split.capitalize()} Original')
-                axes[0].axis('off')
-                
-                # Ground truth mask
-                axes[1].imshow(gt_mask, cmap='tab10', vmin=0, vmax=4)
-                axes[1].set_title(f'{split.capitalize()} Ground Truth Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)')
-                axes[1].axis('off')
-                
-                # Prediction mask
-                axes[2].imshow(pred_mask, cmap='tab10', vmin=0, vmax=4)
-                axes[2].set_title(f'{split.capitalize()} Prediction Mask\n(0:bg, 1:upper, 2:lower, 3:specific, 4:other)')
-                axes[2].axis('off')
-                
-                # Create overlay comparison
-                overlay_img = img_np.copy()
-                # Highlight differences between prediction and ground truth
-                diff_mask = (pred_mask != gt_mask)
-                overlay_img[diff_mask] = [1.0, 0.0, 0.0]  # Red for differences
-                
-                axes[3].imshow(overlay_img)
-                axes[3].set_title(f'{split.capitalize()} Differences\n(Red: prediction ≠ ground truth)')
-                axes[3].axis('off')
+                # If no specific tooth found, show confidence information
+                axes[2, 1].text(0.1, 0.7,
+                               f'Classification Confidence: {cls_confidence:.3f}\n'
+                               f'Segmentation Confidence: {seg_confidence:.3f}\n'
+                               f'Predicted Probability: {cls_probs[pred_tooth_id].item():.3f}',
+                               fontsize=12, transform=axes[2, 1].transAxes)
+                axes[2, 1].set_title('Confidence Scores', fontsize=12, fontweight='bold')
+                axes[2, 1].axis('off')
+            
+            # Performance metrics summary
+            current_metrics = {k: v for k, v in trainer.callback_metrics.items() if 'val' in k or 'train' in k}
+            metrics_text = f'Epoch: {trainer.current_epoch}\n'
+            if 'val_total_loss' in current_metrics:
+                metrics_text += f'Total Loss: {current_metrics["val_total_loss"]:.4f}\n'
+            if 'val_seg_iou' in current_metrics:
+                metrics_text += f'Seg IoU: {current_metrics["val_seg_iou"]:.4f}\n'
+            if 'val_cls_acc' in current_metrics:
+                metrics_text += f'Cls Acc: {current_metrics["val_cls_acc"]:.4f}'
+            
+            axes[2, 2].text(0.1, 0.7, metrics_text, fontsize=12, transform=axes[2, 2].transAxes)
+            axes[2, 2].set_title('Current Metrics', fontsize=12, fontweight='bold')
+            axes[2, 2].axis('off')
             
             plt.tight_layout()
             
@@ -260,14 +384,17 @@ class ImageLoggingCallback(Callback):
             plt.close(fig)
 
 
-def setup_callbacks(monitor_metric='val_loss', checkpoint_dir='./checkpoints', model_name=None, monitor_iou=True):
+def setup_callbacks(monitor_metric='val_total_loss', checkpoint_dir='./multi_task_checkpoints',
+                   model_name=None, monitor_iou=True, mode='multi-task'):
     """
-    Setup training callbacks
+    Setup training callbacks for multi-task learning
     
     Args:
         monitor_metric: Metric to monitor for checkpointing
         checkpoint_dir: Directory to save checkpoints
         model_name: Model name for organizing checkpoints
+        monitor_iou: Whether to monitor IoU metrics
+        mode: Training mode - determines which metrics to monitor
     
     Returns:
         List of callbacks
@@ -278,51 +405,103 @@ def setup_callbacks(monitor_metric='val_loss', checkpoint_dir='./checkpoints', m
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Model checkpoint callbacks
-    filename_prefix = f'{model_name}-' if model_name else 'best-model-'
+    filename_prefix = f'{model_name}-' if model_name else f'{mode}-'
     
-    # Checkpoint for best validation loss
+    callbacks = []
+    
+    # Always monitor total loss
     checkpoint_loss_callback = ModelCheckpoint(
-        monitor='val_loss',
+        monitor='val_total_loss',
         dirpath=checkpoint_dir,
-        filename=f'{filename_prefix}' + 'best-loss-epoch={epoch:02d}-val_loss={val_loss:.4f}',
-        save_top_k=3,
+        filename=f'{filename_prefix}' + 'best-total-loss-epoch={epoch:02d}-val_total_loss={val_total_loss:.4f}',
+        save_top_k=1,  # Save only the best model
         mode='min',
-        save_last=True
+        save_last=False  # Don't save last checkpoint to save storage
     )
+    callbacks.append(checkpoint_loss_callback)
     
-    # Checkpoint for best validation IoU (if monitoring IoU)
-    if monitor_iou:
-        checkpoint_iou_callback = ModelCheckpoint(
-            monitor='val_iou',
+    # Monitor segmentation metrics only for segmentation and multi-task modes
+    if mode in ['segmentation', 'multi-task']:
+        if monitor_iou:
+            checkpoint_iou_callback = ModelCheckpoint(
+                monitor='val_seg_iou',
+                dirpath=checkpoint_dir,
+                filename=f'{filename_prefix}' + 'best-iou-epoch={epoch:02d}-val_seg_iou={val_seg_iou:.4f}',
+                save_top_k=1,  # Save only the best model
+                mode='max'
+            )
+            callbacks.append(checkpoint_iou_callback)
+    
+    # Monitor classification metrics only for classification and multi-task modes
+    if mode in ['classification', 'multi-task']:
+        checkpoint_cls_callback = ModelCheckpoint(
+            monitor='val_cls_acc',
             dirpath=checkpoint_dir,
-            filename=f'{filename_prefix}' + 'best-iou-epoch={epoch:02d}-val_iou={val_iou:.4f}',
-            save_top_k=3,
+            filename=f'{filename_prefix}' + 'best-cls-acc-epoch={epoch:02d}-val_cls_acc={val_cls_acc:.4f}',
+            save_top_k=1,  # Save only the best model
             mode='max'
         )
+        callbacks.append(checkpoint_cls_callback)
     
-    # Early stopping callback - optimized for 5 epochs
+    # Early stopping callback
     early_stop_callback = EarlyStopping(
-        monitor='val_loss',
-        min_delta=0.001,   # Slightly less sensitive for short training
-        patience=3,        # Allow some fluctuation in 5 epochs
+        monitor='val_total_loss',
+        min_delta=0.001,
+        patience=3,
         verbose=True,
         mode='min'
     )
+    callbacks.append(early_stop_callback)
     
-    # Image logging callback - log images every epoch
-    image_logging_callback = ImageLoggingCallback(log_every_n_epochs=1, num_samples=4)
+    # Multi-task image logging callback
+    image_logging_callback = MultiTaskImageLoggingCallback(log_every_n_epochs=1, num_samples=4)
+    callbacks.append(image_logging_callback)
     
-    # Return all callbacks
-    callbacks = [checkpoint_loss_callback, early_stop_callback, image_logging_callback]
-    if monitor_iou:
-        callbacks.append(checkpoint_iou_callback)
+    # Learning rate monitor callback
+    lr_monitor_callback = LearningRateMonitor(logging_interval='epoch')
+    callbacks.append(lr_monitor_callback)
+    
+    # Gradient accumulation scheduler (optional)
+    gradient_accumulation_callback = GradientAccumulationScheduler(scheduling={0: 1})
+    callbacks.append(gradient_accumulation_callback)
+    
+    print(f"✅ Setup {len(callbacks)} callbacks for {mode} training:")
+    for i, callback in enumerate(callbacks):
+        print(f"   {i+1}. {callback.__class__.__name__}")
     
     return callbacks
 
 
+def get_advanced_training_config():
+    """
+    Get advanced training configuration with comprehensive monitoring options
+    
+    Returns:
+        dict: Advanced training configuration
+    """
+    return {
+        'gradient_clip_val': 1.0,
+        'gradient_clip_algorithm': "norm",
+        'accumulate_grad_batches': 1,
+        'num_sanity_val_steps': 2,
+        'overfit_batches': 0,
+        'val_check_interval': None,
+        'precision': '32-true',
+        'detect_anomaly': False,
+        'profiler': None,
+        'benchmark': True,  # Enable cudnn benchmark for faster training
+        'enable_checkpointing': True,
+        'enable_progress_bar': True,
+        'enable_model_summary': True,
+        'deterministic': False,
+        'log_every_n_steps': 10,
+        'check_val_every_n_epoch': 1,
+    }
+
+
 def setup_trainer(max_epochs, devices, strategy, callbacks, logger=None, experiment_name=None):
     """
-    Setup PyTorch Lightning trainer
+    Setup PyTorch Lightning trainer with enhanced monitoring and debugging
     
     Args:
         max_epochs: Maximum number of training epochs
@@ -335,7 +514,14 @@ def setup_trainer(max_epochs, devices, strategy, callbacks, logger=None, experim
     Returns:
         Trainer instance
     """
-    print("🔄 Setting up trainer...")
+    print("🔄 Setting up trainer with enhanced monitoring...")
+    
+    # Get advanced training configuration
+    advanced_config = get_advanced_training_config()
+    
+    print("📊 Advanced training configuration:")
+    for key, value in advanced_config.items():
+        print(f"   - {key}: {value}")
     
     return L.Trainer(
         max_epochs=max_epochs,
@@ -344,17 +530,13 @@ def setup_trainer(max_epochs, devices, strategy, callbacks, logger=None, experim
         strategy=strategy,
         callbacks=callbacks,
         logger=logger,
-        log_every_n_steps=10,
-        check_val_every_n_epoch=1,
-        enable_progress_bar=True,
-        enable_model_summary=True,
-        deterministic=False  # Disable deterministic algorithms for multi-class segmentation
+        **advanced_config
     )
 
 
-def test_model_loading(model_path, data_module):
+def test_multi_task_model_loading(model_path, data_module):
     """
-    Test model loading and inference to verify device compatibility
+    Test multi-task model loading and inference to verify device compatibility
     
     Args:
         model_path: Path to saved model checkpoint
@@ -363,23 +545,23 @@ def test_model_loading(model_path, data_module):
     Returns:
         bool: True if test successful, False otherwise
     """
-    print("🧪 Testing model loading and inference...")
+    print("🧪 Testing multi-task model loading and inference...")
     
     try:
-        # Check if checkpoint file exists (only rank 0 saves the model in distributed training)
+        # Check if checkpoint file exists
         if not os.path.exists(model_path):
             print(f"⚠️  Checkpoint not found: {model_path}")
             return False
             
         # Load model with proper device handling
         if torch.cuda.is_available():
-            loaded_model = ToothSegmentationModel.load_from_checkpoint(
+            loaded_model = ToothModel.load_from_checkpoint(
                 model_path,
                 map_location='cuda'
             )
             loaded_model = loaded_model.cuda()
         else:
-            loaded_model = ToothSegmentationModel.load_from_checkpoint(
+            loaded_model = ToothModel.load_from_checkpoint(
                 model_path,
                 map_location='cpu'
             )
@@ -399,180 +581,69 @@ def test_model_loading(model_path, data_module):
             tooth_ids = tooth_ids.to(device)
             
             with torch.no_grad():
-                outputs = loaded_model(images, tooth_ids)
-                # For multi-class segmentation, masks should be long type
+                seg_outputs, cls_outputs = loaded_model(images, tooth_ids)
+                
+                # Calculate segmentation metrics
                 masks_long = masks.long()
-                loss = loaded_model.criterion(outputs, masks_long)
+                seg_loss = loaded_model.seg_criterion(seg_outputs, masks_long)
+                seg_preds = torch.softmax(seg_outputs, dim=1)
+                seg_preds_class = torch.argmax(seg_preds, dim=1)
+                seg_iou = loaded_model.val_seg_iou(seg_preds_class, masks_long)
                 
-                # Calculate predictions for multi-class segmentation
-                preds = torch.softmax(outputs, dim=1)
-                preds_class = torch.argmax(preds, dim=1)
+                # Calculate classification metrics
+                cls_targets = torch.argmax(tooth_ids, dim=1)
+                cls_loss = loaded_model.cls_criterion(cls_outputs, cls_targets)
+                cls_preds = torch.softmax(cls_outputs, dim=1)
+                cls_preds_class = torch.argmax(cls_preds, dim=1)
+                cls_accuracy = loaded_model.val_cls_acc(cls_preds_class, cls_targets)
                 
-                # Calculate IoU using torchmetrics
-                iou = loaded_model.val_iou(preds_class, masks_long)
-                
-            print(f"✅ Loaded model test - Loss: {loss.item():.4f}, IoU: {iou.item():.4f}")
+                total_loss = loaded_model.seg_loss_weight * seg_loss + loaded_model.cls_loss_weight * cls_loss
+            
+            print(f"✅ Loaded multi-task model test - Total Loss: {total_loss.item():.4f}")
+            print(f"   Segmentation - Loss: {seg_loss.item():.4f}, IoU: {seg_iou.item():.4f}")
+            print(f"   Classification - Loss: {cls_loss.item():.4f}, Accuracy: {cls_accuracy.item():.4f}")
             return True
             
     except Exception as e:
-        print(f"❌ Model loading test failed: {e}")
+        print(f"❌ Multi-task model loading test failed: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
-def visualize_results(model, data_module, result_dir='./results', num_samples=5, model_name=None):
-    """
-    Visualize training, validation, and test results
-    
-    Args:
-        model: Trained model
-        data_module: Data module
-        result_dir: Directory to save results
-        num_samples: Number of samples to visualize
-        model_name: Model name for organizing results
-    """
-    # Create model-specific result directory with train/val/test subdirectories
-    if model_name:
-        result_dir = os.path.join(result_dir, model_name)
-    
-    splits = ['train', 'val', 'test']
-    for split in splits:
-        split_dir = os.path.join(result_dir, split)
-        os.makedirs(split_dir, exist_ok=True)
-    
-    model.eval()
-    
-    # Get device
-    device = next(model.parameters()).device
-    
-    # Visualize for each split
-    for split in splits:
-        print(f"📊 Visualizing {split} results...")
-        
-        # Get dataloader
-        if split == 'train':
-            dataloader = data_module.train_dataloader()
-        elif split == 'val':
-            dataloader = data_module.val_dataloader()
-        else:
-            dataloader = data_module.test_dataloader()
-        
-        # Process samples
-        for batch_idx, (images, masks, tooth_ids) in enumerate(dataloader):
-            if batch_idx >= num_samples:
-                break
-                
-            # Move to device
-            images = images.to(device)
-            masks = masks.to(device)
-            tooth_ids = tooth_ids.to(device)
-            
-            with torch.no_grad():
-                outputs = model(images, tooth_ids)
-                preds = torch.softmax(outputs, dim=1)
-                preds_class = torch.argmax(preds, dim=1)
-            
-            # Convert tensors to numpy for visualization
-            for i in range(images.shape[0]):
-                # Original image (denormalize)
-                img_np = images[i].cpu().numpy().transpose(1, 2, 0)
-                img_np = img_np * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
-                img_np = np.clip(img_np, 0, 1)
-                
-                # Ground truth mask (multi-class)
-                gt_mask = masks[i].cpu().numpy()
-                
-                # Prediction (multi-class)
-                pred_mask = preds_class[i].cpu().numpy().astype(np.uint8)
-                
-                # Create overlay images with different colors for each class
-                # Ground truth overlay (multi-color mask on original image)
-                gt_overlay = img_np.copy()
-                # Class 1: Upper teeth - Red
-                gt_overlay[gt_mask == 1] = [1.0, 0.0, 0.0]
-                # Class 2: Lower teeth - Green
-                gt_overlay[gt_mask == 2] = [0.0, 1.0, 0.0]
-                # Class 3: Specific tooth - Blue
-                gt_overlay[gt_mask == 3] = [0.0, 0.0, 1.0]
-                # Class 4: Other - Yellow
-                gt_overlay[gt_mask == 4] = [1.0, 1.0, 0.0]
-                
-                # Prediction overlay (multi-color mask on original image)
-                pred_overlay = img_np.copy()
-                # Class 1: Upper teeth - Red
-                pred_overlay[pred_mask == 1] = [1.0, 0.0, 0.0]
-                # Class 2: Lower teeth - Green
-                pred_overlay[pred_mask == 2] = [0.0, 1.0, 0.0]
-                # Class 3: Specific tooth - Blue
-                pred_overlay[pred_mask == 3] = [0.0, 0.0, 1.0]
-                # Class 4: Other - Yellow
-                pred_overlay[pred_mask == 4] = [1.0, 1.0, 0.0]
-                
-                split_dir = os.path.join(result_dir, split)
-                
-                # For train and val, save ground truth visualization
-                if split in ['train', 'val']:
-                    # Ground truth visualization
-                    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                    
-                    # Original image with ground truth overlay
-                    axes[0].imshow(gt_overlay)
-                    axes[0].set_title(f'{split.capitalize()} Ground Truth Overlay\n(Red:Upper, Green:Lower, Blue:Specific, Yellow:Other)')
-                    axes[0].axis('off')
-                    
-                    # Ground truth mask
-                    axes[1].imshow(gt_mask, cmap='tab10', vmin=0, vmax=4)
-                    axes[1].set_title('Ground Truth Mask (Multi-class)')
-                    axes[1].axis('off')
-                    
-                    plt.tight_layout()
-                    plt.savefig(f'{split_dir}/gt_sample_{batch_idx}_{i}.png', dpi=150, bbox_inches='tight')
-                    plt.close()
-                
-                # Save prediction visualization for all splits
-                fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                
-                # Original image with prediction overlay
-                axes[0].imshow(pred_overlay)
-                axes[0].set_title(f'{split.capitalize()} Prediction Overlay\n(Red:Upper, Green:Lower, Blue:Specific, Yellow:Other)')
-                axes[0].axis('off')
-                
-                # Prediction mask
-                axes[1].imshow(pred_mask, cmap='tab10', vmin=0, vmax=4)
-                axes[1].set_title('Prediction Mask (Multi-class)')
-                axes[1].axis('off')
-                
-                plt.tight_layout()
-                plt.savefig(f'{split_dir}/pred_sample_{batch_idx}_{i}.png', dpi=150, bbox_inches='tight')
-                plt.close()
-    
-    print(f"✅ Results saved to {result_dir}")
-
-
 def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Train tooth segmentation model')
+    """Parse command line arguments for multi-task training"""
+    parser = argparse.ArgumentParser(description='Train multi-task tooth segmentation and classification model')
     
     parser.add_argument('--model', type=str, default='deeplabv3_resnet50',
-                       choices=['deeplabv3_resnet50', 'deeplabv3_resnet101', 
-                               'fcn_resnet50', 'fcn_resnet101', 
+                       choices=['deeplabv3_resnet50', 'deeplabv3_resnet101',
+                               'fcn_resnet50', 'fcn_resnet101',
                                'lraspp_mobilenet_v3_large'],
                        help='Model architecture to use')
     
     parser.add_argument('--data_dir', type=str, default='../data/ToothSegmDataset',
                        help='Path to dataset directory')
     
-    parser.add_argument('--batch_size', type=int, default=128,
+    parser.add_argument('--batch_size', type=int, default=48,
                        help='Batch size for training')
     
-    parser.add_argument('--epochs', type=int, default=5,
+    parser.add_argument('--epochs', type=int, default=15,
                        help='Number of training epochs')
     
     parser.add_argument('--lr', type=float, default=1e-5,
                        help='Learning rate')
     
-    parser.add_argument('--comet_api_key', type=str, default='',
+    parser.add_argument('--seg_loss_weight', type=float, default=0.7,
+                       help='Weight for segmentation loss')
+    
+    parser.add_argument('--cls_loss_weight', type=float, default=0.3,
+                       help='Weight for classification loss')
+    
+    parser.add_argument('--mode', type=str, default='multi-task',
+                       choices=['classification', 'segmentation', 'multi-task'],
+                       help='Training mode: classification only, segmentation only, or multi-task')
+    
+    parser.add_argument('--comet_api_key', type=str, default='LXYMHm1xV9Y09OfGVdmB0YQUy',
                        help='Comet ML API key (optional)')
     
     parser.add_argument('--comet_project', type=str, default='tooth-segmentation',
@@ -581,20 +652,20 @@ def parse_args():
     parser.add_argument('--comet_experiment', type=str, default=None,
                        help='Comet ML experiment name')
     
-    parser.add_argument('--result_dir', type=str, default='./results',
+    parser.add_argument('--result_dir', type=str, default='./multi_task_results',
                        help='Directory to save visualization results')
     
-    parser.add_argument('--gpus', type=str, default='0,2',
+    parser.add_argument('--gpus', type=str, default='0,1,2,3',
                        help='GPU devices to use (comma-separated)')
     
     return parser.parse_args()
 
 
 def main():
-    """Main training function"""
+    """Main multi-task training function"""
     args = parse_args()
     
-    print("🚀 Starting tooth segmentation training...")
+    print("🚀 Starting multi-task tooth segmentation and classification training...")
     print(f"🎯 Using model: {args.model}")
     
     # Configuration
@@ -604,15 +675,18 @@ def main():
         'num_workers': 36,
         'max_epochs': args.epochs,
         'learning_rate': args.lr,
+        'seg_loss_weight': args.seg_loss_weight,
+        'cls_loss_weight': args.cls_loss_weight,
         'model_name': args.model,
+        'mode': args.mode,
         'devices': [int(gpu) for gpu in args.gpus.split(',')],
         'strategy': 'ddp_find_unused_parameters_true',
-        'tooth_ids': ['11', '12', '13', '14', '15', '16', '17', 
+        'tooth_ids': ['11', '12', '13', '14', '15', '16', '17',
                      '21', '22', '23', '24', '25', '26', '27',
                      '34', '35', '36', '37', '45', '46', '47'],  # All teeth
         'comet_api_key': args.comet_api_key,
         'comet_project': args.comet_project,
-        'comet_experiment': args.comet_experiment or f'{args.model}_experiment',
+        'comet_experiment': args.comet_experiment or f'{args.model}_multi_task_experiment',
         'result_dir': args.result_dir
     }
     
@@ -625,6 +699,7 @@ def main():
         print(f"   - {model_name}")
     
     print(f"🎯 Using model: {config['model_name']}")
+    print(f"⚖️  Loss weights - Segmentation: {config['seg_loss_weight']}, Classification: {config['cls_loss_weight']}")
     
     # Setup Comet ML logger
     comet_logger = setup_comet_logger(
@@ -641,20 +716,25 @@ def main():
         tooth_ids=config['tooth_ids']
     )
     
-    # Create model
-    model = create_model(
+    # Create unified tooth model
+    model = create_multi_task_model(
         model_name=config['model_name'],
-        num_classes=5,  # Multi-class segmentation: 5 classes (0-4)
+        num_seg_classes=5,  # Multi-class segmentation: 5 classes (0-4)
+        num_tooth_classes=31,  # Classification: 31 tooth ID classes
         learning_rate=config['learning_rate'],
-        tooth_ids=config['tooth_ids']
+        seg_loss_weight=config['seg_loss_weight'],
+        cls_loss_weight=config['cls_loss_weight'],
+        tooth_ids=config['tooth_ids'],
+        mode=config['mode']
     )
     
     # Setup callbacks with model name and IoU monitoring
     callbacks = setup_callbacks(
-        monitor_metric='val_loss',
-        checkpoint_dir='./checkpoints',
+        monitor_metric='val_total_loss',
+        checkpoint_dir='./multi_task_checkpoints',
         model_name=config['model_name'],
-        monitor_iou=True
+        monitor_iou=True,
+        mode=config['mode']
     )
     
     # Setup trainer
@@ -667,7 +747,7 @@ def main():
     )
     
     # Start training
-    print("🎬 Starting training...")
+    print("🎬 Starting multi-task training...")
     try:
         trainer.fit(model, data_module)
         
@@ -683,31 +763,14 @@ def main():
             # Only test loading and visualization if the checkpoint file exists
             if os.path.exists(best_model_path):
                 # Test model loading
-                test_model_loading(best_model_path, data_module)
-                
-                # Load best model for visualization
-                if torch.cuda.is_available():
-                    best_model = ToothSegmentationModel.load_from_checkpoint(
-                        best_model_path,
-                        map_location='cuda'
-                    )
-                    best_model = best_model.cuda()
-                else:
-                    best_model = ToothSegmentationModel.load_from_checkpoint(
-                        best_model_path,
-                        map_location='cpu'
-                    )
-                
-                # Generate visualization results with model name
-                print("🎨 Generating visualization results...")
-                visualize_results(best_model, data_module, result_dir=config['result_dir'], model_name=config['model_name'])
+                test_multi_task_model_loading(best_model_path, data_module)
             else:
-                print("⚠️  Best model checkpoint not found, skipping visualization")
+                print("⚠️  Best model checkpoint not found, skipping loading test")
         
-        print("✅ Training completed successfully!")
+        print("✅ Multi-task training completed successfully!")
         
     except Exception as e:
-        print(f"❌ Training failed: {e}")
+        print(f"❌ Multi-task training failed: {e}")
         import traceback
         traceback.print_exc()
 
